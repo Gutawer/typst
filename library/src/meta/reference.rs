@@ -184,10 +184,11 @@ impl Show for RefElem {
             })
             .at(span)?;
 
-        let numbers = refable
-            .counter()
-            .at(vt, elem.location().unwrap())?
-            .display(vt, &numbering.trimmed())?;
+        let numbers = refable.counter().at(vt, elem.location().unwrap())?.display(
+            vt,
+            &numbering.trimmed(),
+            elem.location().unwrap(),
+        )?;
 
         let supplement = match self.supplement(styles) {
             Smart::Auto => refable.supplement(),

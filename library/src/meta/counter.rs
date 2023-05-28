@@ -275,6 +275,36 @@ use crate::prelude::*;
 ///
 /// - returns: array
 ///
+/// ### within()
+/// Sets the counter to count within another counter from this point in the
+/// document, allowing for functionality such as equations which display as
+/// `(1.2)`, with `1` being the heading number, and `2` being the equation
+/// number.
+///
+/// When a counter, say `sub`, is within another counter, say `main`, two things
+/// happen. The first is that whenever `sub` displays, it prepends the current
+/// value of `main` before doing numbering. The second is that whenever
+/// `main` changes (potentially only at some levels), `sub` will re-set to `0`.
+/// This effectively links the `sub` counter to the `main` counter.
+///
+/// For example, you can write `{counter(math.equation).within(heading)}` to make
+/// equations count within the heading they are contained in. See the `level`
+/// parameter for how you can make this ignore deep enough headings.
+///
+/// - within: string or label or function or selector (positional, required)
+///   The counter to count within after this point in the document.
+///   This argument works the same way as the `key` argument in
+///   [`counter`]($func/counter).
+///
+/// - level: none or integer
+///   The maximum level to look at on the `within` counter when determining
+///   what to display, or when to reset. For example, if you call
+///   `{counter(math.equation).within(heading, level: 1)}`, then equations will
+///   be formatted as `(1.2)` even when within a level-2 heading, and a level-2
+///   heading will not make the `math.equation` counter reset.
+///
+/// - returns: content
+///
 /// Display: Counter
 /// Category: meta
 /// Returns: counter
@@ -326,6 +356,13 @@ impl Counter {
                 ))
                 .into(),
             "update" => self.update(args.expect("value or function")?).into(),
+            "within" => WithinChangeElem::new(
+                self.clone(),
+                Counter::new(args.expect("within")?),
+                args.named("level")?,
+            )
+            .pack()
+            .into(),
             "at" => self.at(&mut vm.vt, args.expect("location")?)?.into(),
             "final" => self.final_(&mut vm.vt, args.expect("location")?)?.into(),
             _ => bail!(span, "type counter has no method `{}`", method),
@@ -344,7 +381,7 @@ impl Counter {
         let sequence = self.sequence(vt)?;
         let offset = vt
             .introspector
-            .query(&Selector::before(self.selector(), location, true))
+            .query(&Selector::before(self.selector(vt.introspector), location, true))
             .len();
         let (mut state, page) = sequence[offset].clone();
         if self.is_page() {
@@ -371,7 +408,7 @@ impl Counter {
         let sequence = self.sequence(vt)?;
         let offset = vt
             .introspector
-            .query(&Selector::before(self.selector(), location, true))
+            .query(&Selector::before(self.selector(vt.introspector), location, true))
             .len();
         let (mut at_state, at_page) = sequence[offset].clone();
         let (mut final_state, final_page) = sequence.last().unwrap().clone();
@@ -383,7 +420,10 @@ impl Counter {
                 vt.introspector.pages().get().saturating_sub(final_page.get());
             final_state.step(NonZeroUsize::ONE, final_delta);
         }
-        Ok(CounterState(smallvec![at_state.first(), final_state.first()]))
+        Ok(CounterState {
+            nums: smallvec![at_state.first(), final_state.first()],
+            within: None,
+        })
     }
 
     /// Produce content that performs a state update.
@@ -418,15 +458,20 @@ impl Counter {
     ) -> SourceResult<EcoVec<(CounterState, NonZeroUsize)>> {
         let mut locator = Locator::chained(locator);
         let mut vt = Vt { world, tracer, locator: &mut locator, introspector };
-        let mut state = CounterState(match &self.0 {
-            // special case, because pages always start at one.
-            CounterKey::Page => smallvec![1],
-            _ => smallvec![0],
-        });
+        let mut state = CounterState {
+            nums: match &self.0 {
+                // special case, because pages always start at one.
+                CounterKey::Page => smallvec![1],
+                _ => smallvec![0],
+            },
+            within: None,
+        };
         let mut page = NonZeroUsize::ONE;
         let mut stops = eco_vec![(state.clone(), page)];
 
-        for elem in introspector.query(&self.selector()) {
+        let mut last_within_nums = smallvec![];
+
+        for elem in introspector.query(&self.selector(introspector)) {
             if self.is_page() {
                 let prev = page;
                 page = introspector.page(elem.location().unwrap());
@@ -437,14 +482,72 @@ impl Counter {
                 }
             }
 
-            if let Some(update) = match elem.to::<UpdateElem>() {
-                Some(elem) => Some(elem.update()),
-                None => match elem.with::<dyn Count>() {
-                    Some(countable) => countable.update(),
-                    None => Some(CounterUpdate::Step(NonZeroUsize::ONE)),
+            let maybe_update = match elem.to::<UpdateElem>() {
+                Some(elem) => {
+                    if elem.counter() == *self {
+                        Some(elem.update())
+                    } else {
+                        None
+                    }
+                }
+                None => match elem.to::<WithinChangeElem>() {
+                    Some(_) => None,
+                    None => {
+                        if let CounterKey::Selector(sel) = &self.0 {
+                            if sel.matches(&elem) {
+                                match elem.with::<dyn Count>() {
+                                    Some(countable) => countable.update(),
+                                    None => Some(CounterUpdate::Step(NonZeroUsize::ONE)),
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
                 },
-            } {
+            };
+            if let Some(update) = maybe_update {
                 state.update(&mut vt, update)?;
+            }
+
+            let reset = if let Some(w) = &state.within {
+                let within_nums =
+                    &w.count.at(&mut vt, elem.location().unwrap()).unwrap().nums;
+                let mut changed = false;
+                for i in 0..w.level.map(usize::from).unwrap_or(usize::MAX) {
+                    match (last_within_nums.get(i), within_nums.get(i)) {
+                        (None, Some(_)) => {
+                            changed = true;
+                            break;
+                        }
+                        (Some(l0), Some(l1)) if l0 != l1 => {
+                            changed = true;
+                            break;
+                        }
+                        (None, None) => {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                last_within_nums = within_nums.clone();
+                changed
+            } else {
+                false
+            };
+            if reset {
+                state.nums = smallvec![0];
+            }
+
+            if let Some(w) = elem.to::<WithinChangeElem>() {
+                if &w.counter() == self {
+                    last_within_nums =
+                        w.within().at(&mut vt, elem.location().unwrap()).unwrap().nums;
+                    state.within =
+                        Some(CounterWithin { count: w.within(), level: w.level() });
+                }
             }
 
             stops.push((state.clone(), page));
@@ -454,12 +557,30 @@ impl Counter {
     }
 
     /// The selector relevant for this counter's updates.
-    fn selector(&self) -> Selector {
+    #[comemo::memoize]
+    fn selector(&self, introspector: Tracked<Introspector>) -> Selector {
+        let within_selector = Selector::Elem(
+            WithinChangeElem::func(),
+            Some(dict! { "counter" => self.clone() }),
+        );
+        let within_changes = introspector.query(&within_selector);
+
         let mut selector =
             Selector::Elem(UpdateElem::func(), Some(dict! { "counter" => self.clone() }));
 
+        selector = Selector::Or(eco_vec![selector, within_selector]);
+
         if let CounterKey::Selector(key) = &self.0 {
             selector = Selector::Or(eco_vec![selector, key.clone()]);
+        }
+
+        if !within_changes.is_empty() {
+            for s in within_changes {
+                let sw = s.to::<WithinChangeElem>().unwrap();
+                let within_counter = sw.within();
+                let sel = within_counter.selector(introspector);
+                selector = Selector::Or(eco_vec![selector, sel]);
+            }
         }
 
         selector
@@ -548,21 +669,31 @@ pub trait Count {
     fn update(&self) -> Option<CounterUpdate>;
 }
 
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct CounterWithin {
+    count: Counter,
+    level: Option<NonZeroUsize>,
+}
+
 /// Counts through elements with different levels.
 #[derive(Debug, Clone, PartialEq, Hash)]
-pub struct CounterState(pub SmallVec<[usize; 3]>);
+pub struct CounterState {
+    pub nums: SmallVec<[usize; 3]>,
+    pub within: Option<CounterWithin>,
+}
 
 impl CounterState {
     /// Advance the counter and return the numbers for the given heading.
     pub fn update(&mut self, vt: &mut Vt, update: CounterUpdate) -> SourceResult<()> {
         match update {
-            CounterUpdate::Set(state) => *self = state,
+            CounterUpdate::Set(state) => self.nums = state.nums,
             CounterUpdate::Step(level) => self.step(level, 1),
             CounterUpdate::Func(func) => {
-                *self = func
-                    .call_vt(vt, self.0.iter().copied().map(Into::into))?
-                    .cast()
+                self.nums = func
+                    .call_vt(vt, self.nums.iter().copied().map(Into::into))?
+                    .cast::<CounterState>()
                     .at(func.span())?
+                    .nums;
             }
         }
         Ok(())
@@ -572,38 +703,72 @@ impl CounterState {
     pub fn step(&mut self, level: NonZeroUsize, by: usize) {
         let level = level.get();
 
-        if self.0.len() >= level {
-            self.0[level - 1] = self.0[level - 1].saturating_add(by);
-            self.0.truncate(level);
+        if self.nums.len() >= level {
+            self.nums[level - 1] = self.nums[level - 1].saturating_add(by);
+            self.nums.truncate(level);
         }
 
-        while self.0.len() < level {
-            self.0.push(1);
+        while self.nums.len() < level {
+            self.nums.push(1);
         }
     }
 
     /// Get the first number of the state.
     pub fn first(&self) -> usize {
-        self.0.first().copied().unwrap_or(1)
+        self.nums.first().copied().unwrap_or(1)
+    }
+
+    fn get_nums(
+        &self,
+        vt: &mut Vt,
+        level: Option<NonZeroUsize>,
+        location: Location,
+    ) -> SourceResult<SmallVec<[usize; 3]>> {
+        Ok(if let Some(CounterWithin { count, level: inner_level }) = &self.within {
+            let state = count.at(vt, location)?;
+            let mut p = state.get_nums(vt, *inner_level, location)?;
+            p.extend(
+                self.nums
+                    .iter()
+                    .take(level.map(usize::from).unwrap_or(usize::MAX))
+                    .copied(),
+            );
+            p
+        } else {
+            self.nums
+                .iter()
+                .take(level.map(usize::from).unwrap_or(usize::MAX))
+                .copied()
+                .collect()
+        })
     }
 
     /// Display the counter state with a numbering.
-    pub fn display(&self, vt: &mut Vt, numbering: &Numbering) -> SourceResult<Content> {
-        Ok(numbering.apply_vt(vt, &self.0)?.display())
+    pub fn display(
+        &self,
+        vt: &mut Vt,
+        numbering: &Numbering,
+        location: Location,
+    ) -> SourceResult<Content> {
+        let nums = self.get_nums(vt, None, location)?;
+        Ok(numbering.apply_vt(vt, &nums)?.display())
     }
 }
 
 cast_from_value! {
     CounterState,
-    num: usize => Self(smallvec![num]),
-    array: Array => Self(array
-        .into_iter()
-        .map(Value::cast)
-        .collect::<StrResult<_>>()?),
+    num: usize => Self { nums: smallvec![num], within: None },
+    array: Array => Self {
+        nums: array
+            .into_iter()
+            .map(Value::cast)
+            .collect::<StrResult<_>>()?,
+        within: None
+    },
 }
 
 cast_to_value! {
-    v: CounterState => Value::Array(v.0.into_iter().map(Into::into).collect())
+    v: CounterState => Value::Array(v.nums.into_iter().map(Into::into).collect())
 }
 
 /// Executes a display of a state.
@@ -658,7 +823,7 @@ impl Show for DisplayElem {
         } else {
             counter.at(vt, location)?
         };
-        state.display(vt, &numbering)
+        state.display(vt, &numbering, location)
     }
 }
 
@@ -679,6 +844,32 @@ struct UpdateElem {
 
 impl Show for UpdateElem {
     #[tracing::instrument(name = "UpdateElem::show", skip(self))]
+    fn show(&self, _: &mut Vt, _: StyleChain) -> SourceResult<Content> {
+        Ok(Content::empty())
+    }
+}
+
+/// Changes a counter's within value.
+///
+/// Display: State
+/// Category: special
+#[element(Locatable, Show)]
+struct WithinChangeElem {
+    /// The counter.
+    #[required]
+    counter: Counter,
+
+    /// The counter to count within.
+    #[required]
+    within: Counter,
+
+    /// The level to count within at.
+    #[required]
+    level: Option<NonZeroUsize>,
+}
+
+impl Show for WithinChangeElem {
+    #[tracing::instrument(name = "WithinChange::show", skip(self))]
     fn show(&self, _: &mut Vt, _: StyleChain) -> SourceResult<Content> {
         Ok(Content::empty())
     }

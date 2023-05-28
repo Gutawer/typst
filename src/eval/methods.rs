@@ -384,6 +384,7 @@ pub fn methods_on(type_name: &str) -> &[(&'static str, bool)] {
             ("at", true),
             ("final", true),
             ("step", true),
+            ("within", true),
             ("update", true),
         ],
         "state" => &[("display", true), ("at", true), ("final", true), ("update", true)],

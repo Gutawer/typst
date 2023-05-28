@@ -375,10 +375,11 @@ impl Outlinable for EquationElem {
             supplement += TextElem::packed("\u{a0}");
         }
 
-        let numbers = self
-            .counter()
-            .at(vt, self.0.location().unwrap())?
-            .display(vt, &numbering)?;
+        let numbers = self.counter().at(vt, self.0.location().unwrap())?.display(
+            vt,
+            &numbering,
+            self.0.location().unwrap(),
+        )?;
 
         Ok(Some(supplement + numbers))
     }

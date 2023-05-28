@@ -260,9 +260,11 @@ impl Show for OutlineElem {
             }
 
             // Add the page number and linebreak.
-            let page = Counter::new(CounterKey::Page)
-                .at(vt, location)?
-                .display(vt, &page_numbering)?;
+            let page = Counter::new(CounterKey::Page).at(vt, location)?.display(
+                vt,
+                &page_numbering,
+                location,
+            )?;
 
             seq.push(page.linked(Destination::Location(location)));
             seq.push(LinebreakElem::new().pack());
@@ -353,7 +355,7 @@ impl OutlineIndent {
                         let numbers = ancestor_outlinable
                             .counter()
                             .at(vt, ancestor.location().unwrap())?
-                            .display(vt, &numbering)?;
+                            .display(vt, &numbering, ancestor.location().unwrap())?;
 
                         hidden += numbers + SpaceElem::new().pack();
                     };

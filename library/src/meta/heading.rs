@@ -197,7 +197,7 @@ impl Outlinable for HeadingElem {
         if let Some(numbering) = self.numbering(StyleChain::default()) {
             let numbers = Counter::of(Self::func())
                 .at(vt, self.0.location().unwrap())?
-                .display(vt, &numbering)?;
+                .display(vt, &numbering, self.0.location().unwrap())?;
             content = numbers + SpaceElem::new().pack() + content;
         };
 
